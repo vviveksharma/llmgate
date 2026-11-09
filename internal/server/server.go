@@ -2,104 +2,162 @@ package server
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
-	"log/slog"
+	"log"
 	"net/http"
+	"os"
+	"strings"
 	"time"
 
-	"github.com/vviveksharma/llmgate/internal/auth"
-	"github.com/vviveksharma/llmgate/internal/config"
-	"github.com/vviveksharma/llmgate/internal/handler"
-	"github.com/vviveksharma/llmgate/internal/middleware"
-	"github.com/vviveksharma/llmgate/internal/observability"
-	"github.com/vviveksharma/llmgate/internal/provider"
-	"github.com/vviveksharma/llmgate/internal/router"
-	"github.com/vviveksharma/llmgate/internal/storage"
-	"github.com/vviveksharma/llmgate/internal/tenant"
-	"github.com/vviveksharma/llmgate/internal/usage"
+	"github.com/ollama/ollama/api"
+	"github.com/vviveksharma.in/llmgate/internal/ollama"
 )
 
+// Server is the HTTP front door for llmgate → Ollama.
 type Server struct {
-	cfg    *config.Config
-	log    *slog.Logger
-	http   *http.Server
-	pg     *storage.Postgres
-	redis  *storage.Redis
+	ollama      *ollama.Client
+	defaultModel string
 }
 
-func New(cfg *config.Config, log *slog.Logger) (*Server, error) {
-	pg, err := storage.NewPostgres(cfg.PostgresDSN)
+func New(ollamaClient *ollama.Client) *Server {
+	return &Server{
+		ollama:       ollamaClient,
+		defaultModel: strings.TrimSpace(os.Getenv("OLLAMA_MODEL")),
+	}
+}
+
+func (s *Server) ListenAndServe(addr string) error {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /health", s.handleHealth)
+	mux.HandleFunc("GET /v1/models", s.handleModels)
+	mux.HandleFunc("POST /v1/chat", s.handleChat)
+
+	srv := &http.Server{
+		Addr:              addr,
+		Handler:           mux,
+		ReadHeaderTimeout: 10 * time.Second,
+	}
+	log.Printf("llmgate listening on %s (OLLAMA_HOST controls upstream)", addr)
+	return srv.ListenAndServe()
+}
+
+func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	names, err := s.ollama.ModelNames(ctx)
 	if err != nil {
-		return nil, err
+		writeError(w, err)
+		return
 	}
-	rds := storage.NewRedis(cfg.RedisAddr)
+	writeJSON(w, http.StatusOK, map[string]any{"models": names})
+}
 
-	reg := provider.NewRegistry(cfg.DefaultProvider)
-	reg.Register(provider.NewMock())
-	reg.Register(provider.NewOllama(""))
+type chatRequest struct {
+	Model    string         `json:"model"`
+	Messages []api.Message  `json:"messages"`
+}
 
-	modelRouter := router.NewModelRouter(reg)
-	usageRepo := usage.NewMemoryRepository()
-	recorder := usage.NewRecorder(usageRepo)
+type chatResponse struct {
+	Model   string `json:"model"`
+	Content string `json:"content"`
+}
 
-	tenantSvc := tenant.NewService(tenant.NewMemoryRepository(nil))
+func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
+	var req chatRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON body"})
+		return
+	}
 
-	apiKeys := auth.NewAPIKeyValidator(map[string]string{"dev-key": "tenant-1"})
-	jwtVal := auth.NewJWTValidator(cfg.JWTSecret)
+	model := strings.TrimSpace(req.Model)
+	if model == "" {
+		model = s.defaultModel
+	}
+	if model == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{
+			"error": "set model in the request body or OLLAMA_MODEL",
+		})
+		return
+	}
 
-	root := http.NewServeMux()
-	root.Handle("GET /metrics", observability.MetricsHandler())
-	root.Handle("GET /healthz", &handler.Health{Ready: func() error {
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		defer cancel()
-		if err := pg.Ping(ctx); err != nil {
-			return err
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Minute)
+	defer cancel()
+
+	content, err := s.ollama.Chat(ctx, model, req.Messages)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, chatResponse{Model: model, Content: content})
+}
+
+func writeError(w http.ResponseWriter, err error) {
+	var statusErr api.StatusError
+	if errors.As(err, &statusErr) {
+		code := statusErr.StatusCode
+		if code == 0 {
+			code = http.StatusBadGateway
 		}
-		return rds.Ping(ctx)
-	}})
-
-	api := http.NewServeMux()
-	Routes(api, Dependencies{
-		Chat:       &handler.Chat{Router: modelRouter, Recorder: recorder},
-		Embeddings: &handler.Embeddings{Router: modelRouter},
-		Admin:      &handler.Admin{Tenants: tenantSvc, JWT: jwtVal},
-	})
-
-	var protected http.Handler = api
-	protected = middleware.NewRateLimit(cfg.RateLimitRPS, cfg.RateLimitBurst).Middleware(protected)
-	protected = middleware.Auth{APIKeys: apiKeys, JWT: jwtVal}.Middleware(protected)
-	root.Handle("/", protected)
-
-	var h http.Handler = root
-	h = middleware.Metrics(h)
-	h = middleware.RequestID(h)
-	h = middleware.Logging(log)(h)
-	h = middleware.Recover(log)(h)
-
-	s := &Server{
-		cfg:   cfg,
-		log:   log,
-		pg:    pg,
-		redis: rds,
-		http: &http.Server{
-			Addr:    cfg.HTTPAddr,
-			Handler: h,
-		},
+		writeJSON(w, code, map[string]string{"error": statusErr.Error()})
+		return
 	}
-
-	return s, nil
+	log.Printf("request error: %v", err)
+	writeJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
 }
 
-func (s *Server) Start() error {
-	s.log.Info("starting gateway", "addr", s.cfg.HTTPAddr)
-	if err := s.http.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-		return fmt.Errorf("listen: %w", err)
+func writeJSON(w http.ResponseWriter, status int, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	if err := json.NewEncoder(w).Encode(v); err != nil {
+		log.Printf("encode response: %v", err)
 	}
-	return nil
 }
 
-func (s *Server) Shutdown(ctx context.Context) error {
-	_ = s.pg.Close()
-	_ = s.redis.Close()
-	return s.http.Shutdown(ctx)
+// AddrFromEnv returns the bind address for llmgate (default :8080).
+func AddrFromEnv() string {
+	if v := strings.TrimSpace(os.Getenv("LLMGATE_ADDR")); v != "" {
+		return v
+	}
+	return ":8080"
+}
+
+func MustOllamaClient() *ollama.Client {
+	c, err := ollama.NewClient()
+	if err != nil {
+		log.Fatalf("ollama: %v", err)
+	}
+	return c
+}
+
+// PingOllama logs a warning if the Ollama daemon is not reachable.
+func PingOllama(c *ollama.Client) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, err := c.ModelNames(ctx); err != nil {
+		log.Printf("warning: ollama not reachable yet (%v). Start it with: ollama serve", err)
+		log.Printf("tip: pull a model with: ollama pull %s", strings.TrimSpace(os.Getenv("OLLAMA_MODEL")))
+		return
+	}
+	log.Print("connected to ollama")
+}
+
+// Help prints usage to stderr.
+func Help() {
+	fmt.Fprintln(os.Stderr, "llmgate — local Ollama client and optional HTTP gateway")
+	fmt.Fprintln(os.Stderr)
+	fmt.Fprintln(os.Stderr, "Usage:")
+	fmt.Fprintln(os.Stderr, "  go run .              chat with Ollama (default prompt: Who are you?)")
+	fmt.Fprintln(os.Stderr, `  go run . "your prompt"  send a custom prompt (quote it in zsh if it has ? * [ etc.)`)
+	fmt.Fprintln(os.Stderr, "  go run . serve        start the HTTP API")
+	fmt.Fprintln(os.Stderr)
+	fmt.Fprintln(os.Stderr, "Environment:")
+	fmt.Fprintln(os.Stderr, "  OLLAMA_HOST    Ollama API URL (default http://127.0.0.1:11434)")
+	fmt.Fprintln(os.Stderr, "  OLLAMA_MODEL   Default model name for POST /v1/chat")
+	fmt.Fprintln(os.Stderr, "  LLMGATE_ADDR   Listen address (default :8080)")
 }
